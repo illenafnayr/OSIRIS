@@ -1,307 +1,212 @@
 import cv2
 import numpy as np
 import time
+from sklearn.cluster import DBSCAN
 from collections import deque
-from scipy.spatial.transform import Rotation as R
 
-# ORB feature detector
-orb = cv2.ORB_create(5000)
+# ---------------- Config ----------------
 VIDEO_SRC = 0
+FRAME_W, FRAME_H = 1280, 720
+FPS_TARGET = 30
 
-# Camera intrinsic parameters (adjust for your camera)
-FOCAL_LENGTH = 800  # pixels
-CAMERA_MATRIX = np.array([
-    [FOCAL_LENGTH, 0, 640],
-    [0, FOCAL_LENGTH, 360],
-    [0, 0, 1]
-], dtype=np.float32)
-DIST_COEFFS = np.zeros((4, 1))
+orb = cv2.ORB_create(5000)
+
+# Clustering
+MIN_FEATURES_PER_OBJECT = 15
+DBSCAN_EPS = 35
+DBSCAN_MIN_SAMPLES = 6
+MAX_CENTROID_DIST = 200
 
 # Motion filtering
-MIN_MOTION_THRESHOLD = 0.5
-MIN_ROTATION_THRESHOLD = 0.01
+MIN_MOTION_THRESHOLD = 0.3
+MIN_ROTATION_THRESHOLD = 0.05
 STATIC_FRAMES_THRESHOLD = 5
 
 # Smoothing
-SMOOTHING_ALPHA = 0.2
-HISTORY_LENGTH = 10
+ALPHA_V = 0.2  # velocity smoothing
+ALPHA_OMEGA = 0.2  # angular velocity smoothing
+HISTORY_LENGTH = 15
 
-# Feature refresh
-FEATURE_REFRESH_INTERVAL = 15
-MIN_FEATURE_COUNT = 200
+# Optical flow
+LK_PARAMS = dict(winSize=(21,21), maxLevel=3,
+                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
-# Optical flow parameters
-LK_PARAMS = dict(
-    winSize=(21, 21),
-    maxLevel=3,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-)
+# ---------------- Helpers ----------------
+def cluster_keypoints(pts):
+    if len(pts) < DBSCAN_MIN_SAMPLES: return {}
+    clustering = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES).fit(pts)
+    clusters = {}
+    for lbl in set(clustering.labels_):
+        if lbl == -1: continue
+        indices = np.where(clustering.labels_ == lbl)[0]
+        if len(indices) >= MIN_FEATURES_PER_OBJECT:
+            clusters[lbl] = indices
+    return clusters
 
-# Assumed object size for depth estimation (meters)
-ASSUMED_OBJECT_SIZE = 0.3
+def compute_motion_magnitude(prev_pts, next_pts):
+    motion = next_pts - prev_pts
+    return np.mean(np.linalg.norm(motion, axis=1))
 
-# ----------------- Helper Functions -----------------
-def estimate_depth_from_size(bbox_size, assumed_real_size=ASSUMED_OBJECT_SIZE):
-    pixel_size = max(bbox_size[0], bbox_size[1])
-    if pixel_size < 10:
-        return 5.0
-    depth = (assumed_real_size * FOCAL_LENGTH) / pixel_size
-    return max(0.5, min(depth, 20.0))
+def rotation_from_flow(prev_pts, next_pts, centroid, dt):
+    if len(prev_pts)<5 or dt<1e-3: return np.array([0,0,1]),0,0
+    prev_centered = prev_pts - centroid
+    next_centered = next_pts - centroid
+    distances = np.linalg.norm(prev_centered, axis=1)
+    valid_mask = distances>5
+    if np.sum(valid_mask)<5: return np.array([0,0,1]),0,0
+    prev_centered = prev_centered[valid_mask]
+    next_centered = next_centered[valid_mask]
+    motion = next_centered - prev_centered
+    radial = prev_centered / (np.linalg.norm(prev_centered, axis=1, keepdims=True)+1e-6)
+    tangential = motion - (motion*radial).sum(axis=1, keepdims=True)*radial
+    omega = np.median(np.linalg.norm(tangential, axis=1)/distances[valid_mask])/dt
+    axis_estimate = np.mean(np.cross(prev_centered, tangential), axis=0)
+    axis_norm = np.linalg.norm(axis_estimate)
+    axis = axis_estimate/axis_norm if axis_norm>1e-6 else np.array([0,0,1])
+    consistency = 1.0 - np.std(np.linalg.norm(tangential, axis=1)/(distances[valid_mask]+1e-6))/(np.mean(np.linalg.norm(tangential, axis=1)/(distances[valid_mask]+1e-6))+1e-6)
+    consistency = np.clip(consistency,0,1)
+    return axis, omega, consistency
 
-def pixel_to_3d(pixel_coords, depth):
-    fx, fy = CAMERA_MATRIX[0, 0], CAMERA_MATRIX[1, 1]
-    cx, cy = CAMERA_MATRIX[0, 2], CAMERA_MATRIX[1, 2]
-    x = (pixel_coords[0] - cx) * depth / fx
-    y = (pixel_coords[1] - cy) * depth / fy
-    z = depth
-    return np.array([x, y, z])
-
-def project_3d_to_2d(point_3d):
-    if point_3d[2] < 0.1:
-        return None
-    fx, fy = CAMERA_MATRIX[0, 0], CAMERA_MATRIX[1, 1]
-    cx, cy = CAMERA_MATRIX[0, 2], CAMERA_MATRIX[1, 2]
-    x_2d = (point_3d[0] * fx / point_3d[2]) + cx
-    y_2d = (point_3d[1] * fy / point_3d[2]) + cy
-    return (int(x_2d), int(y_2d))
-
-def estimate_3d_rotation(prev_pts_2d, next_pts_2d, prev_depth, next_depth):
-    prev_pts_3d = np.array([pixel_to_3d(pt, prev_depth) for pt in prev_pts_2d])
-    next_pts_3d = np.array([pixel_to_3d(pt, next_depth) for pt in next_pts_2d])
-
-    prev_centroid = np.mean(prev_pts_3d, axis=0)
-    next_centroid = np.mean(next_pts_3d, axis=0)
-    prev_centered = prev_pts_3d - prev_centroid
-    next_centered = next_pts_3d - next_centroid
-
-    H = prev_centered.T @ next_centered
-    U, S, Vt = np.linalg.svd(H)
-    R_matrix = Vt.T @ U.T
-    if np.linalg.det(R_matrix) < 0:
-        Vt[-1, :] *= -1
-        R_matrix = Vt.T @ U.T
-
-    try:
-        rot = R.from_matrix(R_matrix)
-        rotvec = rot.as_rotvec()
-        angle = np.linalg.norm(rotvec)
-        axis = rotvec / angle if angle > 1e-6 else np.array([0,0,1])
-        angle = angle if angle > 1e-6 else 0
-    except:
-        axis = np.array([0,0,1])
-        angle = 0
-
-    residuals = np.linalg.norm(next_centered - (R_matrix @ prev_centered.T).T, axis=1)
-    quality = 1.0 / (1.0 + np.mean(residuals))
-    return R_matrix, axis, angle, quality
-
-def compute_3d_velocity(prev_pos_3d, curr_pos_3d, dt):
-    return (curr_pos_3d - prev_pos_3d) / dt if dt > 0.001 else np.zeros(3)
-
-def detect_new_features(gray, existing_pts=None, mask_radius=20):
-    mask = None
-    if existing_pts is not None and len(existing_pts) > 0:
-        mask = np.ones(gray.shape, dtype=np.uint8)*255
-        for pt in existing_pts:
-            cv2.circle(mask, tuple(pt.astype(int)), mask_radius, 0, -1)
+def detect_new_features(gray, mask=None):
     kp = orb.detect(gray, mask)
-    if kp and len(kp) > 0:
-        new_pts = np.array([k.pt for k in kp], dtype=np.float32)
-        if existing_pts is not None and len(existing_pts) > 0:
-            return np.vstack([existing_pts, new_pts])
-        return new_pts
-    return existing_pts
+    if kp and len(kp)>0:
+        return np.array([k.pt for k in kp], dtype=np.float32)
+    return np.array([])
 
-# ----------------- Visualization Functions -----------------
-def draw_3d_bounding_box(frame, center_3d, size, rotation_matrix, depth):
-    half_size = size / 2
-    corners_3d = np.array([
-        [-half_size, -half_size, -half_size],
-        [half_size, -half_size, -half_size],
-        [half_size, half_size, -half_size],
-        [-half_size, half_size, -half_size],
-        [-half_size, -half_size, half_size],
-        [half_size, -half_size, half_size],
-        [half_size, half_size, half_size],
-        [-half_size, half_size, half_size]
-    ])
-    rotated_corners = (rotation_matrix @ corners_3d.T).T + center_3d
-    corners_2d = [project_3d_to_2d(c) for c in rotated_corners]
-    if any(c is None for c in corners_2d): return
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
-    for s,e in edges: cv2.line(frame, corners_2d[s], corners_2d[e], (0,255,255),2)
-    for s,e in [(4,5),(5,6),(6,7),(7,4)]: cv2.line(frame, corners_2d[s], corners_2d[e], (0,255,0),3)
+# ---------------- Tracker State ----------------
+class TrackedObject:
+    def __init__(self):
+        self.centroid = None
+        self.velocity = np.array([0.0,0.0])
+        self.axis = np.array([0,0,1])
+        self.omega = 0.0
+        self.motion_history = deque(maxlen=HISTORY_LENGTH)
+        self.omega_history = deque(maxlen=HISTORY_LENGTH)
+        self.static_counter = 0
+        self.centroid_history = deque(maxlen=HISTORY_LENGTH)
+        self.last_update = time.time()
 
-def draw_3d_axes(frame, center_3d, rotation_matrix, scale=0.1):
-    axes_3d = np.array([[scale,0,0],[0,scale,0],[0,0,scale]])
-    rotated_axes = (rotation_matrix @ axes_3d.T).T + center_3d
-    origin_2d = project_3d_to_2d(center_3d)
-    if origin_2d is None: return
-    axes_2d = [project_3d_to_2d(a) for a in rotated_axes]
-    for idx,color in enumerate([(0,0,255),(0,255,0),(255,0,0)]):
-        cv2.line(frame, origin_2d, axes_2d[idx], color,4)
-        cv2.circle(frame, axes_2d[idx],5,color,-1)
+tracker = TrackedObject()
 
-# ----------------- Initialize -----------------
+# ---------------- Main Loop ----------------
 cap = cv2.VideoCapture(VIDEO_SRC)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
 
 prev_gray = None
-prev_pts_all = None
-tracked_object = None
-prev_time = time.time()
-frame_count = 0
+prev_pts = None
 last_feature_refresh = 0
+frame_count = 0
+prev_time = time.time()
 
-print("Single-Object 3D Rotation Tracker\n" + "="*50)
+print("Smooth Single-Object Tracker")
 
-# ----------------- Main Loop -----------------
 while True:
     ret, frame = cap.read()
     if not ret: break
-
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
-
+    gray = cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8)).apply(gray)
     now = time.time()
-    dt = max(now - prev_time, 0.001)
+    dt = max(now-prev_time, 1e-3)
     prev_time = now
-    frame_count += 1
+    frame_count +=1
 
-    # ----------------- Initialize features -----------------
-    if prev_gray is None or prev_pts_all is None:
-        kp = orb.detect(gray, None)
-        if kp and len(kp) >= 8:
-            prev_pts_all = np.array([k.pt for k in kp], dtype=np.float32)
-            print(f"Initialized with {len(prev_pts_all)} features")
+    # initialize features
+    if prev_gray is None or prev_pts is None or len(prev_pts)<50:
+        prev_pts = detect_new_features(gray)
         prev_gray = gray.copy()
         continue
 
-    # ----------------- Periodic feature refresh -----------------
-    if frame_count - last_feature_refresh > FEATURE_REFRESH_INTERVAL:
-        if len(prev_pts_all) < MIN_FEATURE_COUNT:
-            prev_pts_all = detect_new_features(gray, prev_pts_all, mask_radius=15)
-            last_feature_refresh = frame_count
+    # optical flow
+    next_pts, status, error = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None, **LK_PARAMS)
+    if next_pts is None: 
+        prev_pts = detect_new_features(gray)
+        prev_gray = gray.copy()
+        continue
+    good_mask = (status.flatten()==1) & (error.flatten()<50)
+    valid_prev = prev_pts[good_mask]
+    valid_next = next_pts[good_mask]
 
-    # ----------------- Optical Flow -----------------
-    next_pts_all, status, error = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts_all, None, **LK_PARAMS)
-    if next_pts_all is None: 
+    # clustering
+    clusters = cluster_keypoints(valid_next)
+    if not clusters:
+        prev_pts = detect_new_features(gray)
         prev_gray = gray.copy()
         continue
 
-    status = status.flatten()
-    error = error.flatten()
-    good_mask = (status==1) & (error<50)
+    # choose best cluster: closest to previous centroid or center
+    best_cluster = None
+    min_dist = float('inf')
+    for lbl, indices in clusters.items():
+        c = np.mean(valid_next[indices], axis=0)
+        if tracker.centroid is not None:
+            dist = np.linalg.norm(c - tracker.centroid)
+        else:
+            dist = np.linalg.norm(c - np.array([FRAME_W/2, FRAME_H/2]))
+        if dist<min_dist:
+            min_dist = dist
+            best_cluster = (lbl, indices)
+    cluster_lbl, indices = best_cluster
+    cluster_prev_pts = valid_prev[indices]
+    cluster_next_pts = valid_next[indices]
+    centroid_prev = np.mean(cluster_prev_pts, axis=0)
+    centroid_next = np.mean(cluster_next_pts, axis=0)
+    velocity = (centroid_next - centroid_prev)/dt
 
-    valid_prev_pts = prev_pts_all[good_mask]
-    valid_next_pts = next_pts_all[good_mask]
+    # rotation
+    axis, omega, quality = rotation_from_flow(cluster_prev_pts, cluster_next_pts, centroid_prev, dt)
 
-    if len(valid_next_pts) < 8:
-        prev_pts_all = detect_new_features(gray, None)
-        prev_gray = gray.copy()
-        continue
-
-    # ----------------- Single Object Tracking -----------------
-    centroid_2d = np.mean(valid_next_pts, axis=0)
-    prev_centroid_2d = np.mean(valid_prev_pts, axis=0)
-    x,y,w,h = cv2.boundingRect(valid_next_pts.astype(np.int32))
-    motion_mag = np.mean(np.linalg.norm(valid_next_pts - valid_prev_pts, axis=1))
-    if motion_mag < MIN_MOTION_THRESHOLD:
-        prev_pts_all = valid_next_pts
-        prev_gray = gray.copy()
-        continue
-
-    depth_curr = estimate_depth_from_size((w,h))
-    object_size = max(w,h) * depth_curr / FOCAL_LENGTH
-    position_3d = pixel_to_3d(centroid_2d, depth_curr)
-
-    if tracked_object is None:
-        tracked_object = {
-            'prev_pts': valid_next_pts.copy(),
-            'position_3d': position_3d,
-            'accumulated_rotation': np.eye(3),
-            'omega': 0,
-            'axis': np.array([0,0,1]),
-            'motion_history': deque([motion_mag], maxlen=HISTORY_LENGTH),
-            'static_counter': 0,
-            'depth': depth_curr
-        }
+    # low-pass filter velocities
+    tracker.velocity = ALPHA_V*velocity + (1-ALPHA_V)*tracker.velocity
+    tracker.omega = ALPHA_OMEGA*omega + (1-ALPHA_OMEGA)*tracker.omega
+    tracker.axis = axis
+    tracker.centroid = centroid_next
+    tracker.motion_history.append(np.linalg.norm(velocity))
+    tracker.omega_history.append(tracker.omega)
+    tracker.centroid_history.append(centroid_next)
+    if np.mean(tracker.motion_history)<MIN_MOTION_THRESHOLD:
+        tracker.static_counter +=1
     else:
-        tracked_object['motion_history'].append(motion_mag)
-        if np.mean(tracked_object['motion_history']) < MIN_MOTION_THRESHOLD:
-            tracked_object['static_counter'] += 1
-            if tracked_object['static_counter'] > STATIC_FRAMES_THRESHOLD:
-                prev_pts_all = valid_next_pts
-                prev_gray = gray.copy()
-                continue
-        else:
-            tracked_object['static_counter'] = 0
+        tracker.static_counter =0
+    if tracker.static_counter>STATIC_FRAMES_THRESHOLD:
+        tracker.omega = 0.0
 
-        # ----------- Rotation estimation with fixed correspondence -----------
-        min_len = min(len(tracked_object['prev_pts']), len(valid_next_pts))
-        if min_len >= 8:
-            R_matrix, axis, angle, quality = estimate_3d_rotation(
-                tracked_object['prev_pts'][:min_len],
-                valid_next_pts[:min_len],
-                tracked_object['depth'],
-                depth_curr
-            )
-            if quality > 0.5:
-                R_accum = R.from_matrix(R_matrix) * R.from_matrix(tracked_object['accumulated_rotation'])
-                tracked_object['accumulated_rotation'] = R_accum.as_matrix()
-                tracked_object['omega'] = SMOOTHING_ALPHA*angle/dt + (1-SMOOTHING_ALPHA)*tracked_object['omega']
-                tracked_object['axis'] = SMOOTHING_ALPHA*axis + (1-SMOOTHING_ALPHA)*tracked_object['axis']
-                tracked_object['axis'] /= np.linalg.norm(tracked_object['axis'])
-        else:
-            R_matrix = np.eye(3)
-            axis = np.array([0,0,1])
-            angle = 0
-            quality = 0
+    # Visualization
+    hull = cv2.convexHull(cluster_next_pts.astype(np.int32))
+    rotation_intensity = min(abs(tracker.omega)/5,1)
+    rotation_color = (0, int(255*rotation_intensity), int(255*(1-rotation_intensity)))
+    cv2.polylines(frame,[hull],True,rotation_color,2)
 
-        velocity_3d = compute_3d_velocity(tracked_object['position_3d'], position_3d, dt)
+    c = tracker.centroid.astype(int)
+    cv2.circle(frame, tuple(c), 5, (0,255,0), -1)
+    cv2.line(frame, tuple(c), tuple(c + (tracker.velocity*10).astype(int)), (255,0,0),2)
+    length=30
+    x_axis = c + np.array([length,0])
+    y_axis = c + np.array([0,length])
+    cv2.line(frame, tuple(c), tuple(x_axis), (0,0,255),2)
+    cv2.line(frame, tuple(c), tuple(y_axis), (0,255,0),2)
+    cv2.putText(frame, f"w:{tracker.omega*180/np.pi:.1f}deg/s", tuple(c+np.array([0,-30])), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
+    cv2.putText(frame, f"vel:{np.linalg.norm(tracker.velocity):.1f}px/s", tuple(c+np.array([0,-15])), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,0),2)
+    cv2.putText(frame, f"Q:{quality:.2f}", tuple(c+np.array([0,0])), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,200,0),1)
 
-        # Update tracked object
-        tracked_object['prev_pts'] = valid_next_pts.copy()
-        tracked_object['position_3d'] = position_3d
-        tracked_object['depth'] = depth_curr
-
-        # ----------------- Visualization -----------------
-        draw_3d_bounding_box(frame, position_3d, object_size, tracked_object['accumulated_rotation'], depth_curr)
-        draw_3d_axes(frame, position_3d, tracked_object['accumulated_rotation'], scale=object_size*0.5)
-
-        cv2.putText(frame, f"Pos:[{position_3d[0]:.2f},{position_3d[1]:.2f},{position_3d[2]:.2f}]m", 
-                    (x, y-50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0),1)
-        cv2.putText(frame, f"Vel:[{velocity_3d[0]:.2f},{velocity_3d[1]:.2f},{velocity_3d[2]:.2f}]m/s", 
-                    (x, y-35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255),1)
-        cv2.putText(frame, f"omega:{tracked_object['omega']*180/np.pi:.1f}deg/s", (x, y-20), 
-                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
-        cv2.putText(frame, f"Axis:[{tracked_object['axis'][0]:.2f},{tracked_object['axis'][1]:.2f},{tracked_object['axis'][2]:.2f}]", 
-                    (x, y-5), cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,200,0),1)
-
-        for pt in valid_next_pts:
-            cv2.circle(frame, tuple(pt.astype(int)), 3, (255,0,255), -1)
-
-    info = f"Frame:{frame_count} | Features:{len(valid_next_pts)}"
-    cv2.putText(frame, info, (10,30), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
-    # cv2.putText(frame, "3D TRACKING MODE", (10,60), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
-
-    cv2.imshow("3D Rotation Tracker", frame)
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27: break
-    elif key == ord('r'):
-        tracked_object = None
-        prev_pts_all = None
-        prev_gray = None
-        print("Tracking reset")
-    elif key == ord('f'):
-        prev_pts_all = detect_new_features(gray, None)
+    # feature refresh
+    if frame_count - last_feature_refresh > 15 or len(prev_pts)<100:
+        prev_pts = detect_new_features(gray)
         last_feature_refresh = frame_count
-        print(f"Feature refresh: {len(prev_pts_all)} features")
 
-    prev_gray = gray.copy()
-    prev_pts_all = valid_next_pts
+    prev_pts = valid_next
+    prev_gray = gray
+    cv2.imshow("Smooth Single Object Tracker", frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key==27: break
+    elif key==ord('r'):
+        prev_pts=None; prev_gray=None; tracker=TrackedObject()
+        print("Tracker reset")
+    elif key==ord('f'):
+        prev_pts = detect_new_features(gray)
+        print(f"Forced feature refresh: {len(prev_pts)} features")
+
 cap.release()
 cv2.destroyAllWindows()
-print("3D Tracking session ended.")
+print("Tracking ended.")
